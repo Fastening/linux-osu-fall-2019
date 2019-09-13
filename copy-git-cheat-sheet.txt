@@ -1,0 +1,19 @@
+     git clone git@github.com:Fastening/linux-osu-fall-2019.git
+     ping github.com
+     git clone git@github.com:Fastening/linux-osu-fall-2019.git
+     git tag -a 2.0.0 -m "My submission for 02 - Homework - Your First Script."
+     git tag -d 2.0.0
+     git add basic-commands.sh 
+     git diff
+     git status
+     git diff
+     git status
+     fastening@fastening:~/linux-osu-fall-2019/02-homework$ git commit -m "added homework 02 bassic commands sh."
+     git commit -m "added homework 02 bassic commands sh."
+     git status
+     git tag -a 2.0.0 -m "My submission for 02 - Homework - Your First Script."
+     git status
+     git push origin master --tags
+     history | grep git > git-cheat-sheet.txt
+     nano git-cheat-sheet.txt 
+     history | grep git > /tmp/git-cheat-sheet.txt
