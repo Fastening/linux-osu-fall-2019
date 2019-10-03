@@ -1,0 +1,1193 @@
+
+
+code words – issue seven
+
+Dragon taming with Tailbiter, a bytecode compiler for Python
+Darius Bacon
+
+“Python is about having the simplest, dumbest compiler imaginable.”
+—Guido van Rossum, Masterminds of Programming
+
+People write source code, machines run machine code. A compiler turns one into the other—how? Somehow stones, taught to read our commands, obey, and the compiler acts at the heart of this magic: it’s the spell that interprets the spell.
+
+Take a course following one of the excellent traditional textbooks such as the Dragon Book—whose cover art acknowledges the aura of the fearsome and uncanny around the subject—and you might spend all semester building one compiler, for a language much simpler than the one you write it in. Did you just call on a big genie to make a small one?
+
+In this article, we’ll make a self-reliant genie—that is, a small compiler able to compile itself. We’ll write it in and for a subset of Python 3. The result—call it Tailbiter—will be a toy, but less of a toy than usual in an introduction: besides the self-compiling, it’ll include some details of debugging support. To make room for these emphases, we will ignore the topic of optimization—or, in plainer terms, of making the output code less stupid.
+
+All you’ll need to follow along is comfort with recursion over a tree, nested functions, and reading a program dependent on some built-in Python libraries and types that I’ll survey but not delve into.
+
+I wrote this article to accompany “A Python Interpreter Written in Python” by fellow Recurser Allison Kaptur. Her chapter explains the CPython bytecode virtual machine, which takes the output of a compiler and executes it. I’ve tried to make this article self-contained, but you’re encouraged to read the other as well. You may also find it helpful to read or run the code without all this prose around it.
+
+So, where do we start?
+
+When I began this project, I knew quite a bit about how to write a compiler, but not very much about the Python virtual machine which we’re targeting. Right away I hit the first snag the textbooks don’t talk about: inadequate documentation.
+
+We’ll respond to this challenge by building in stages, from a seed just capable of turning the simplest source code into working bytecode, learning from each stage how to grow into the next. Start with an example of our input and our output: a trivial program, from its source text to parsed syntax and then to runnable bytecode. This technique of “growing” your program in small stages is useful when working in an uncertain domain.
+
+The input: an abstract syntax tree
+Say hello!
+
+# in greet.py:
+name = 'Chrysophylax'
+print('Hi,', name)
+The first step is to dissect this text and expose its grammatical structure: that is, to parse it. The parsed form is called an abstract syntax tree (or AST); Python’s ast.parse function can produce it for us. How ast.parse works would take a whole separate article.
+
+# in transcripts:
+>>> import ast, dis, astpp # astpp from http://alexleone.blogspot.com/2010/01/python-ast-pretty-printer.html
+>>> with open('greet.py') as f: module_text = f.read()
+... 
+>>> module_ast = ast.parse(module_text)
+>>> print(astpp.dump(module_ast, include_attributes=True))
+Module(body=[
+    Assign(targets=[
+        Name(id='name', ctx=Store(), lineno=1, col_offset=0),
+      ], value=Str(s='Chrysophylax', lineno=1, col_offset=7), lineno=1, col_offset=0),
+    Expr(value=Call(func=Name(id='print', ctx=Load(), lineno=2, col_offset=0), args=[
+        Str(s='Hi,', lineno=2, col_offset=6),
+        Name(id='name', ctx=Load(), lineno=2, col_offset=16),
+      ], keywords=[], starargs=None, kwargs=None, lineno=2, col_offset=0), lineno=2, col_offset=0),
+  ])
+We get an ast.Module whose body is a list of more of these ast objects—in this case two, an ast.Assign representing name = 'Chrysophylax' and an ast.Expr representing the call to print—each of these being built out of further ast objects: a tree of them. Each object has fields proper to its type, plus a lineno (line number) and col_offset telling where in the source text it was parsed from. We’ll sweat these details more when we get to them.
+
+You can find all the AST classes and their fields in Python.asdl in the Python 3 source distribution. It’s 100+ lines long, with roughly one line per class; we’ll need to handle a fair fraction of them to achieve our goal of a self-hosting compiler.
+
+The output: bytecode
+Compiling the module (with Python’s built-in compiler, for now) yields a code object, which is an internal Python type:
+
+# in transcripts:
+>>> module_code = compile(module_ast, 'greet.py', 'exec')
+>>> module_code
+<code object <module> at 0xffdd76b0, file "greet.py", line 1>
+It has a bunch of attributes prefixed with co_:
+
+# in examples:
+co_argcount       0
+co_cellvars       ()
+co_code           b'd\x00\x00Z\x00\x00e\x01\x00d\x01\x00e\x00\x00\x83\x02\x00\x01d\x02\x00S'
+co_consts         ('Chrysophylax', 'Hi,', None)
+co_filename       greet.py
+co_firstlineno    1
+co_flags          64
+co_freevars       ()
+co_kwonlyargcount 0
+co_lnotab         b'\x06\x01'
+co_name           <module>
+co_names          ('name', 'print')
+co_nlocals        0
+co_stacksize      3
+co_varnames       ()
+What happened to our program? Mostly it’s encoded into co_code: a sequence of bytecodes in a bytestring1. These bytecodes can be “disassembled” (made human-readable) using dis.dis:
+
+# in transcripts:
+>>> dis.dis(module_code)
+  1           0 LOAD_CONST               0 ('Chrysophylax')
+              3 STORE_NAME               0 (name)
+
+  2           6 LOAD_NAME                1 (print)
+              9 LOAD_CONST               1 ('Hi,')
+             12 LOAD_NAME                0 (name)
+             15 CALL_FUNCTION            2 (2 positional, 0 keyword pair)
+             18 POP_TOP
+             19 LOAD_CONST               2 (None)
+             22 RETURN_VALUE
+On the left are source-code line numbers (1 and 2); down the middle go bytecode instructions, each labeled with the address it’s encoded at; and on the right each instruction may get an optional argument. The first line, then, shows us the instruction at address 0: a LOAD_CONST instruction, with 0 as an argument. (For a LOAD_CONST the argument means an index into the co_consts attribute, whose 0th entry, above, is indeed 'Chrysophylax'.) This instruction appears in co_code as d\x00\x00: one byte d which happens to mean LOAD_CONST, followed by two bytes encoding the integer 0. (Don’t worry yet about the exact details; we’re looking for a general impression of how the program is encoded.)
+
+Since that first instruction took three bytes, the next (STORE_NAME) appears at address 3. It also has 0 as its argument, but this time indexing into co_names. (That is, at runtime the bytecode interpreter will take the value it just loaded and store it in the variable listed at index 0 of co_names: in this case, name.)
+
+Those two bytecodes implemented the first line of source code (name = 'Chrysophylax'). The second line’s bytecode follows at addresses 6 through 18, with some new wrinkles in instruction arguments: CALL_FUNCTION has two, each of one byte; and POP_TOP has no argument, making the whole instruction fit in a byte. (What POP_TOP does, we’ll come back to; likewise the details of how print’s arguments get passed.)
+
+Finally, the last two instructions (at 19 and 22) return from running the module.
+
+Zooming back out, what did the compiler do? It converted a tree structure into a sequence of instructions to perform the operations in the right order. Each subtree of the parse tree turned into a subsequence of the instructions. Diagramming the AST together with the assembly code shows this correspondence2:
+
+Module(
+ body=[
+  Assign(
+   value=Str(s='Chrysophylax'),           0 LOAD_CONST      0 ('Chrysophylax')
+   targets=[Name(id='name',ctx=Store())]  3 STORE_NAME      0 (name)
+  ),
+  Expr(
+   value=Call(
+    func=Name(id='print', ctx=Load()),    6 LOAD_NAME       1 (print)
+    args=[
+     Str(s='Hi,'),                        9 LOAD_CONST      1 ('Hi,')
+     Name(id='name', ctx=Load()),        12 LOAD_NAME       0 (name)
+    ]
+   )                                     15 CALL_FUNCTION   2 (2 positional, 0 keyword pair)
+  )                                      18 POP_TOP
+ ]                                       19 LOAD_CONST      2 (None)
+                                         22 RETURN_VALUE
+)
+Many of the nodes in this tree turned into one bytecode instruction each, in almost the same order. (Call precedes its arguments in the tree, but CALL_FUNCTION follows them.) That’s a common pattern but with plenty of exceptions.
+
+The bytecode we just saw was meant for CPython 3.4; in other versions of Python the bytecode varies, maybe even for this tiny example. It might crash other interpreters. The AST types can also change from version to version, though typically less, and with less drastic consequences (an exception instead of a crash or a subtle low-level bug). In this article we’ll stick to Python 3.4; you can find the tweaks for 3.5 or 3.6 in the code repository.
+
+A symbolic assembly form
+Now that we’ve defined our problem a bit better, we can take our first step: building a compiler that can compile greet.py. We will do this by somehow translating the ast produced by greet.py into bytecode.
+
+To create the code object we saw above, it’d help to be able to write Python code that resembles the disassembly. Like this:
+
+# in examples.py:
+assembly_for_greet = (  SetLineNo(1)
+                      + op.LOAD_CONST(0)
+                      + op.STORE_NAME(0)
+                      + SetLineNo(2)
+                      + op.LOAD_NAME(1)
+                      + op.LOAD_CONST(1)
+                      + op.LOAD_NAME(0)
+                      + op.CALL_FUNCTION(2)
+                      + op.POP_TOP
+                      + op.LOAD_CONST(0)
+                      + op.RETURN_VALUE)
+Later we’ll get to the support code that lets us write this; first let’s see how it’s used. SetLineNo tells which source line the following instructions derive from; it’s a pseudo-instruction, supplying debug info to the code object, instead of going into the bytecode string with op.LOAD_CONST(0) and the rest. These symbolic instructions and pseudo-instructions are all Python objects that understand + to mean concatenation. Their “sum” then is also an object representing assembly code (as in the Gang of Four “composite” pattern, or a monoid if that’s how you were raised). Thus, we can build our code in pieces to be strung together, like
+
+# in examples.py:
+stmt1 = op.LOAD_CONST(0) + op.STORE_NAME(0)
+call = (op.LOAD_NAME(1) + op.LOAD_CONST(1) + op.LOAD_NAME(0)
+        + op.CALL_FUNCTION(2))
+stmt2 = call + op.POP_TOP
+assembly_for_greet = (  SetLineNo(1) + stmt1
+                      + SetLineNo(2) + stmt2
+                      + op.LOAD_CONST(0) + op.RETURN_VALUE)
+which produces the same bytecode: it doesn’t matter how we chunk the assembly.
+
+There are a couple of reasons why this intermediate “assembly language” is a useful place to start building our program. Since the bytecode specification is a source of major uncertainty for us, this layer isolates our tinkering with the bytecode to a very specific place in our program. Since the bytecode specification also changes more often than the AST spec does, this also provides us with an “insulating layer” between these two problem domains.
+
+A higher-level assembly language could’ve been made where instead of op.LOAD_CONST(0) this example would say op.LOAD_CONST('Chrysophylax'), leaving it to the assembler to turn 'Chrysophylax' into an index into co_consts. Likewise op.STORE_NAME would take a string argument, and so on. Such a design would better suit a general-purpose bytecode assembler; but Tailbiter will be ruthless in doing only what’s needed. It’s simple for the code generator to encode the arguments into integers, more so than for the assembler.
+
+The seed: a “hello world” compiler
+We want to build a code object, but we don’t know all the details that go into one. To face these uncertainties and start learning, let’s make a complete working system for a tiny core subset of the problem: just enough to run our greet.py.
+
+# in figure 0: AST types understood by Tailbiter version 0.
+mod = Module(stmt* body)
+stmt = Assign(expr* targets, expr value)
+     | Expr(expr value)
+expr = Call(expr func, expr* args, keyword* keywords)
+     | Num(object n)
+     | Str(string s)
+     | Bytes(bytes s)
+     | NameConstant(singleton value)
+     | Name(identifier id, expr_context ctx)
+expr_context = Load | Store
+keyword = (identifier arg, expr value)
+Figure 0 lists the AST classes we’ll need to handle, and their fields. The second line, for instance, means that one type of statement is ast.Assign, which has a list of target expressions (the * means a list) and a value expression. This represents statements like x = y = 2+3, with x and y as targets.
+
+CPython uses a tool to generate all of the AST classes from these declarations—it’s another tiny compiler of a sort—though to us they’re just documentation.
+
+Here is the whole compiler as a “literate program”: a part in angle brackets like <<the assembler>> stands for more code we’ll see later. When we do, we’ll show it starting with # in the assembler:. Later we’ll get to two fancier versions of the same compiler, and they’ll sometimes use chunks like # in the assembler v1: (replacing the earlier version, v0) and # in CodeGen v1+: (appearing in v1 and also v2; this lets us say # in CodeGen v2 to add to and not replace v1).
+
+# in tailbiter.py:
+import ast, collections, dis, types, sys
+from functools import reduce
+from itertools import chain
+from check_subset import check_conformity
+
+<<the assembler>>
+<<the code generator>>
+<<compile and run a file>>
+
+if __name__ == '__main__':
+    sys.argv.pop(0)
+    run(sys.argv[0], '__main__')
+Note that we’ve chosen to write a very small but working compiler as our first step—the code generator and the assembler will implement only fragments of the full job of a code generator or assembler, just the fragments needed by our first Python subset. Alternatively, we could have restricted our exploration to just one of the layers (e.g. translating our assembly to bytecode) and completed it before moving on.
+
+The technique of writing a minimalist but fully-functioning prototype is often called a “spike.” This is because we are writing a program that “drives” through all the layers that we think we are going to exist in our finished product.
+
+The goal of a spike is to detect any obvious problems in our overall design as early as possible. It is thus important that we accept we may have to throw all of this code away—in fact, there are many development methodologies that require you to throw away the code and start again, no matter how successful the spike was in proving the design.
+
+Let’s further explore our proposed spike. sys.argv.pop(0) removes the initial argv[0] to leave the command-line arguments the same as if we’d run Python on the source program directly: thus (with the compiler in tailbiter.py) you can run python greet.py, or python tailbiter.py greet.py, or (eventually) python tailbiter.py tailbiter.py greet.py…
+
+# in compile and run a file:
+def run(filename, module_name):
+    f = open(filename)
+    source = f.read()
+    f.close()
+    return module_from_ast(module_name, filename, ast.parse(source))
+
+def module_from_ast(module_name, filename, t):
+    code = code_for_module(module_name, filename, t)
+    module = types.ModuleType(module_name, ast.get_docstring(t))
+    exec(code, module.__dict__)
+    return module
+
+<<compile to code>>
+Throughout the compiler, t (for “tree”) names an AST object (also called a “node”). Here ast.parse gives us a tree, we make a code object from it with code_for_module (to be written), then we let CPython execute the code to populate a new module object. These are the same actions as Python performs when you import a module, except for calling on our new compiler in place of compile. (We won’t look into how Python’s import-hook machinery could let us make import call on our loader instead of the default one.)
+
+From AST to code
+The last underspecified step in our spike is <<compile to code>>, which we will implement in code_for_module. This function takes the module’s AST and converts it to bytecode. This means that we’re going to need some tools to help us traverse the AST.
+
+We could try doing this from scratch, in a style like:
+
+# in examples.py:
+def example(t):
+    if   isinstance(t, ast.Module):
+        return "(A module {})".format(' '.join(map(example, t.body)))
+    elif isinstance(t, ast.Expr):
+        return "(An expression {})".format(example(t.value))
+    elif isinstance(t, ast.Num):
+        return "(A number {})".format(t.n)
+    else:
+        raise Error("I don't know how to handle this kind of node", t)
+However, the visitor classes in Python’s ast module make our task a little more convenient:
+
+class ExampleVisitor(ast.NodeVisitor):
+    def visit_Module(self, t):
+        return "(A module {})".format(' '.join(map(self.visit, t.body)))
+    def visit_Expr(self, t):
+        return "(An expression {})".format(self.visit(t.value))
+    def visit_Num(self, t):
+        return "(A number {})".format(t.n)
+This is called like so:
+
+# in transcripts:
+>>> v = ExampleVisitor()
+>>> v.visit(ast.parse('5'))
+'(A module (An expression (A number 5)))'
+>>> print(astpp.dump(ast.parse('5')))
+Module(body=[
+    Expr(value=Num(n=5)),
+  ])
+The visitor pattern separates the concern of traversing the tree (which is the same every time) from what we actually want to do in each traversal (which is situational). This lets us define separately-callable methods one a time rather than inserting elifs into a master function. These single-purpose methods are easy to understand, test, and reuse later if the need arises.
+
+A module becomes a code object
+We’ve designed our compiler as a visitor that returns assembly code. As it walks through the tree, it remembers the names and constants it’s seen, so that the emitted instructions can refer to names and constants by index. After the walk it assembles the assembly code into a code object.
+
+Let’s instantiate this code-generation visitor and set it to work in our main compiler flow:
+
+# in compile to code v0:
+def code_for_module(module_name, filename, t):
+    return CodeGen(filename, StubScope()).compile_module(t, module_name)
+
+class StubScope: freevars, cellvars, derefvars = (), (), ()
+
+<<CodeGen>>
+(For the first time, we’re seeing stub code that will be superseded in a fancier version of the compiler. We’ll return here later!)
+
+Our CodeGen visitor will have:
+
+Methods to start traversing and to wrap up the completed code object.
+Tables holding the traversal state.
+visit_X methods for each type of AST node, each returning an assembly-code sequence.
+Helper methods to generate some common code sequences.
+# in CodeGen v0+:
+class CodeGen(ast.NodeVisitor):
+
+    def __init__(self, filename, scope):
+        self.filename  = filename
+        self.scope     = scope
+        self.constants = make_table()
+        self.names     = make_table()
+        self.varnames  = make_table()
+Recall the disassembly of a module, above: there was the body code, then LOAD_CONST of None, then RETURN_VALUE. We turn that assembly into a code object:
+
+# in CodeGen v0+:
+    def compile_module(self, t, name):
+        assembly = self(t.body) + self.load_const(None) + op.RETURN_VALUE
+        return self.make_code(assembly, name, 0)
+
+    def make_code(self, assembly, name, argcount):
+        kwonlyargcount = 0
+        nlocals = len(self.varnames)
+        stacksize = plumb_depths(assembly)
+        flags = (  (0x02 if nlocals                  else 0)
+                 | (0x10 if self.scope.freevars      else 0)
+                 | (0x40 if not self.scope.derefvars else 0))
+        firstlineno, lnotab = make_lnotab(assembly)
+        return types.CodeType(argcount, kwonlyargcount,
+                              nlocals, stacksize, flags, assemble(assembly),
+                              self.collect_constants(),
+                              collect(self.names), collect(self.varnames),
+                              self.filename, name, firstlineno, lnotab,
+                              self.scope.freevars, self.scope.cellvars)
+Note that we begin the traversal process by calling self(t.body)—this is because CodeGen is a callable object. This means when you invoke an instance c of CodeGen as if it is a function, Python will translate that into c.__call__(your args). So what does __call__ do on CodeGen?
+
+    def __call__(self, t):
+        if isinstance(t, list): return concat(map(self, t)) 
+        assembly = self.visit(t)
+        return SetLineNo(t.lineno) + assembly if hasattr(t, 'lineno') else assembly
+It takes an AST node or a list of such nodes; when it’s a list we get back all the results concatenated. We could define separate methods for visiting a list vs. a node, but conflating them turns out to unify some code to come.
+
+Once we visit a node, producing its assembly code, we can annotate the assembly with the node’s source-line number. This spares us from writing the same in every visit_Whatever method.
+
+We haven’t implemented visit yet, but we’re calling it here. This is the default, NodeVisitor superclass implementation of the visit method: it calls the right visit_Whatever method for the type of the node visited.
+
+If this visit_Whatever is missing, NodeVisitor.visit will then call the template method generic_visit. This should never happen; however, we’re certainly going to make some mistakes during development. The default implementation of generic_visit does nothing, which makes it hard for us to notice when we’ve tried to handle a node type we’re not ready for yet. So, let’s make some noise if this ever happens:
+
+    def generic_visit(self, t):
+        raise NotImplementedError()
+The state of a traversal
+make_code wants to make a code object that’s littered with fields:
+
+The bytecode bytes themselves, from assemble(assembly).
+
+Redundant info too costly to compute at runtime, like stacksize.
+
+Metadata like lnotab. lnotab tells what line number in the source file produced what part of the bytecode. (The name’s not my fault!)
+
+The above-mentioned tables for constants and names.
+
+These tables are built from defaultdicts that grow as we walk the tree, to appear as tuples when collected into the code object:
+
+# in the code generator:
+def make_table():
+    table = collections.defaultdict(lambda: len(table))
+    return table
+
+def collect(table):
+    return tuple(sorted(table, key=table.get))
+For names and varnames, the keys are the name strings; but it gets trickier for constants. Equal names get the same slot in a names table, but “equal” constants might not: for example, 5 == 5.0 is true, but 5 and 5.0 are nonetheless distinct. Therefore we key on the type as well as the value of the constant:
+
+# in CodeGen v0+:
+    def load_const(self, constant):
+        return op.LOAD_CONST(self.constants[constant, type(constant)])
+
+    def collect_constants(self):
+        return tuple([constant for constant,_ in collect(self.constants)])
+There’s a further subtlety in comparing with signed floating-point zeroes, which we’ll punt on by expelling negative zeroes in constants from the subset of the language we’re going to handle. A check_conformity module, not presented in this article, can be called to make sure the input program is in our subset.
+
+Expressions employ the stack
+Our first tiny mini-Python understands only assignment and expression statements, where the expressions may be names, simple constants, and function calls. A constant expression turns into a LOAD_CONST instruction:
+
+    def visit_NameConstant(self, t): return self.load_const(t.value) # for None/True/False
+    def visit_Num(self, t):          return self.load_const(t.n)
+    def visit_Str(self, t):          return self.load_const(t.s)
+    visit_Bytes = visit_Str
+A variable name also becomes a single instruction, but the choice depends on context: a name can appear as the target of an assignment, not just in an expression. Python ASTs use the same node-type for both roles, with a ctx field to distinguish them:
+
+    def visit_Name(self, t):
+        if   isinstance(t.ctx, ast.Load):  return self.load(t.id)
+        elif isinstance(t.ctx, ast.Store): return self.store(t.id)
+        else: assert False
+
+<<generate variable accesses>>
+Later, when we compile functions and classes, they’ll need fancier logic for loads and stores because names will live in different scopes; but for now all names are global:
+
+# in generate variable accesses v0:
+    def load(self, name):  return op.LOAD_NAME(self.names[name])
+    def store(self, name): return op.STORE_NAME(self.names[name])
+Now, function calls: a call like f(x, y, key=42) compiles to
+
+# in examples:
+       0 LOAD_NAME                0 (f)
+       3 LOAD_NAME                1 (x)
+       6 LOAD_NAME                2 (y)
+       9 LOAD_CONST               0 ('key')
+      12 LOAD_CONST               1 (42)
+      15 CALL_FUNCTION          258 (2 positional, 1 keyword pair)
+Evidently the load instructions stash their values somewhere for CALL_FUNCTION to use. That somewhere is the “stack:” a growing and shrinking list of values. Each load appends to it, and each call removes a function and its arguments from the end and replaces them with one value: the result of the call.3 This scheme gives for a more complex expression like f(g(7), h()) a place for the partial results to live:
+
+# in examples:
+                                               (the stack afterwards)
+       0 LOAD_NAME                0 (f)        [f]
+       3 LOAD_NAME                1 (g)        [f, g]
+       6 LOAD_CONST               0 (7)        [f, g, 7]
+       9 CALL_FUNCTION            1            [f, g(7)]
+      12 LOAD_NAME                2 (h)        [f, g(7), h]
+      15 CALL_FUNCTION            0            [f, g(7), h()]
+      18 CALL_FUNCTION            2            [f(g(7), h())]
+The assembly code for the full, compound call is a concatenation of the assembly for its parts: if you compiled just g(7) or h(), you’d get some of the same code above (except perhaps for the choice of indices assigned to the names g and h).
+
+# in CodeGen v0+:
+    def visit_Call(self, t):
+        assert len(t.args) < 256 and len(t.keywords) < 256
+        return (self(t.func) + self(t.args) + self(t.keywords)
+                + op.CALL_FUNCTION((len(t.keywords) << 8) | len(t.args)))
+
+    def visit_keyword(self, t):
+        return self.load_const(t.arg) + self(t.value)
+We recursively generate code for the function, the arguments, and the keyword arguments (which in turn are built from the keyword name t.arg and the value expression), then chain them together with CALL_FUNCTION at the end.4 The stack made this code generation simple: if instead we’d been assigning values to numbered registers, for instance, then we’d have had to keep track of these assignments and generate code depending on them.
+
+Statements evaluate expressions
+Executing a statement should leave the stack unchanged. For an expression statement (consisting of just an expression, typically a call), we evaluate the expression and then remove its value from the stack:
+
+    def visit_Expr(self, t):
+        return self(t.value) + op.POP_TOP
+An assignment evaluates the expression as well, then stores it in the target; all the store instructions also pop the stack.
+
+    def visit_Assign(self, t):
+        def compose(left, right): return op.DUP_TOP + left + right
+        return self(t.value) + reduce(compose, map(self, t.targets))
+The complication here deals with multiple assignments like x = y = 42: there’s a list of targets (x and y). If we followed the expression’s code with two store instructions, the second would be stuck without the value to store, because the first popped it off; so before the first one, we insert a DUP_TOP instruction, which will push a duplicate reference to the value.
+
+(We already covered generating the store instructions: the targets are the Name nodes we saw in visit_Name.)
+
+We fabricate an assembler
+We still need to create assembly code—instructions, SetLineNo pseudo-instructions, and concatenations—and to compute three functions of it: the maximum stack depth, the line-number table, and the encoded bytecode. The most direct and minimal stub represents an assembly instruction as its final bytecode sequence, makes the line-number table empty, and pretends the stack depth is, say, 10—don’t try it with too-complex nested calls.
+
+# in assembly types and functions v0:
+def Instruction(opcode, arg):
+    return bytes([opcode] if arg is None else [opcode, arg % 256, arg // 256])
+
+def concat(assemblies):     return b''.join(assemblies)
+def SetLineNo(lineno):      return b''
+def make_lnotab(assembly):  return 1, b''
+def plumb_depths(assembly): return 10
+def assemble(assembly):     return assembly
+We fill in op so that op.DUP_TOP and all the rest work.
+
+# in the assembler:
+<<assembly types and functions>>
+
+def denotation(opcode):
+    if opcode < dis.HAVE_ARGUMENT:
+        return Instruction(opcode, None)
+    else:
+        return lambda arg: Instruction(opcode, arg)
+
+op = type('op', (), dict([(name, denotation(opcode))
+                          for name, opcode in dis.opmap.items()]))
+And at last greet.py works. Hurrah!
+
+# in transcripts:
+$ python3 tailbiter0.py greet.py 
+Hi, Chrysophylax
+A compiler half-grown: assembling control flow
+Now that we have driven our spike through all of the layers of our compiler architecture, we can think about how to build out more complicated use cases. We don’t yet have any control flow in our Python subset, which is a pretty critical omission. We can’t import either, meaning our programs can’t even get at Python’s standard library in the usual way. Let’s tackle these issues, and handle more of the basic expression and statement types, in version 1.
+
+# in figure 1: AST types added in Tailbiter version 1.
+stmt = For(expr target, expr iter, stmt* body)
+     | While(expr test, stmt* body)
+     | If(expr test, stmt* body, stmt* orelse)
+     | Raise(expr exc)
+     | Import(alias* names)
+     | ImportFrom(identifier? module, alias* names, int? level)
+     | Pass
+alias = (identifier name, identifier? asname)
+
+expr = BoolOp(boolop op, expr* values)
+     | BinOp(expr left, operator op, expr right)
+     | UnaryOp(unaryop op, expr operand)
+     | IfExp(expr test, expr body, expr orelse)
+     | Dict(expr* keys, expr* values)
+     | Compare(expr left, cmpop* ops, expr* comparators)
+     | Attribute(expr value, identifier attr, expr_context ctx)
+     | Subscript(expr value, slice slice, expr_context ctx)
+     | List(expr* elts, expr_context ctx) 
+     | Tuple(expr* elts, expr_context ctx)
+slice = Index(expr value) 
+boolop = And | Or 
+operator = Add | Sub | Mult | Div | Mod | Pow | LShift 
+         | RShift | BitOr | BitXor | BitAnd | FloorDiv
+unaryop = Invert | Not | UAdd | USub
+cmpop = Eq | NotEq | Lt | LtE | Gt | GtE | Is | IsNot | In | NotIn
+At this point, it’s worth asking ourselves if we’re going to face any problems in v1 that are materially different from what we faced in v0. What if we made a design decision in v0 that makes it impossible to proceed?
+
+Indeed, control-flow constructs like if-else do present us with a challenge we haven’t faced yet: they require us to “jump around” in the bytecode.
+
+For example, the statement
+
+# in examples:
+if ok:
+    yes
+else:
+    no
+becomes
+
+  1           0 LOAD_NAME                0 (ok)
+              3 POP_JUMP_IF_FALSE       13
+
+  2           6 LOAD_NAME                1 (yes)
+              9 POP_TOP
+             10 JUMP_FORWARD             4 (to 17)
+
+  4     >>   13 LOAD_NAME                2 (no)
+             16 POP_TOP
+        >>   17 ...
+where POP_JUMP_IF_FALSE does what it says: pops the value left by ok, tests it, and if it’s false jumps to index 13—that is, executes that instruction next. Otherwise execution continues to the usual next instruction, at 6. JUMP_FORWARD likewise jumps to index 17, to skip no if we chose yes.
+
+Why’s this a problem that our current design can’t handle? During code generation the compiler may not yet know the bytecode index where the jump target will be.
+
+Our answer: we augment the assembly language with symbolic labels for the targets, to be resolved later by the assemble function.
+
+# in CodeGen v1+:
+    def visit_If(self, t):
+        orelse, after = Label(), Label()
+        return (           self(t.test) + op.POP_JUMP_IF_FALSE(orelse)
+                         + self(t.body) + op.JUMP_FORWARD(after)
+                + orelse + self(t.orelse)
+                + after)
+A label like after can appear in two kinds of places: as an instruction’s argument (like op.JUMP_FORWARD(after)) or on its own (like + after). assemble will have to note the position where it appeared in the code on its own, and encode the bytecode address of that position for the JUMP_FORWARD instruction.
+
+This design is not inevitable. Notice that the example’s JUMP_FORWARD argument was encoded as 4, when the target is at index 17: 4 means the distance, taken from the instruction right after the jump (at index 13), to the target. Encoded this way, it’s a “relative” jump.
+
+Suppose all the jumps were relative. We could easily compute the offsets, just knowing the encoded size of each block of code: e.g. the offset from the JUMP_FORWARD to after is the size of self(t.orelse). There’d be a similar computation for the jump to orelse. We could skip the symbolic assembly phase and keep generating bytecode strings directly, like Tailbiter v0.
+
+Sadly for this dream, POP_JUMP_IF_FALSE here encodes its target differently, as the absolute address 13. We could consider designing this part more like a “linker” than an assembler, but it is safer to keep to CPython’s design: it makes surprises less likely.
+
+We analyze assembly code
+Let’s make labels work, and unstub the rest of the assembler: computing stack depths and line-number tables.
+
+# in assembly types and functions v1:
+def assemble(assembly):
+    return bytes(iter(assembly.encode(0, dict(assembly.resolve(0)))))
+Assembly code is now some kind of object we’ll define—several kinds, for instructions, labels, SetLineNo, and a couple more. To turn it into bytecode, we first resolve the addresses of its labels (starting at address 0), then encode it into bytes using the addresses now known—a “two-pass assembler.”
+
+def plumb_depths(assembly):
+    depths = [0]
+    assembly.plumb(depths)
+    return max(depths)
+For the maximum stack depth, we ask plumb to compute the depth after every instruction, appending them all to depths. (This uses more space than needed, to make Assembly.plumb’s job simple.)
+
+Computing the line-number table calls on a line_nos method which yields pairs of (bytecode address, source-code line-number), the smaller addresses first. make_lnotab consumes them and encodes them into a bytestring in a format imposed by the VM interpreter, designed to try to keep the table small: usually just a couple of bytes per line. Each successive pair of bytes in the table encodes an (address, line_number) pair as the differences from the previous pair. With a byte’s limited range, 0 to 255, this design faces two problems:
+
+A difference could be negative. Given x = (two_line_expression), for instance, the bytecode for the store to x goes after the bytecode for the expression. As there’s no way to express this reversal in this format, we have to decide how to distort it. Like CPython, we’ll pretend the store to x is on the last line of source.
+
+The difference could exceed 255. Then the entry must take up multiple successive byte-pairs, first increasing only the address part in each, and then increasing the line number. (If we increased both at once, there’d be ambiguity about whether an intermediate line number covered part of the range, as explained in CPython’s implementation notes.)
+
+def make_lnotab(assembly):
+    firstlineno, lnotab = None, []
+    byte, line = 0, None
+    for next_byte, next_line in assembly.line_nos(0):
+        if firstlineno is None:
+            firstlineno = line = next_line
+        elif line < next_line:
+            while byte+255 < next_byte:
+                lnotab.extend([255, 0])
+                byte = byte+255
+            while line+255 < next_line:
+                lnotab.extend([next_byte-byte, 255])
+                byte, line = next_byte, line+255
+            if (byte, line) != (next_byte, next_line):
+                lnotab.extend([next_byte-byte, next_line-line])
+                byte, line = next_byte, next_line
+    return firstlineno or 1, bytes(lnotab)
+And concat can’t be just b''.join anymore:
+
+def concat(assemblies):
+    return sum(assemblies, no_op)
+Assembly objects will need an __add__ method for all the code we’ve been seeing like assembly + op.POP_TOP. Python’s sum() calls the same method.
+
+Assembly comes in types
+The simplest assembly fragment is the no-op:
+
+class Assembly:
+    def __add__(self, other):
+        return Chain(self, other)
+    length = 0
+    def resolve(self, start):
+        return ()
+    def encode(self, start, addresses):
+        return b''
+    def line_nos(self, start):
+        return ()
+    def plumb(self, depths):
+        pass
+
+no_op = Assembly()
+For resolve’s use, all our assembly objects hold a length counting how many bytes of bytecode they’ll become. We’ll take it to be constant, since we don’t support the extended-length argument format. (Suppose there were a relative jump to an address over 65535 bytes away. The jump instruction would need to occupy more than the usual 3 bytes; if we’d assumed 3 bytes, this could imply cascading changes to other offsets.)
+
+A Label is just like no_op, except resolving to an address.
+
+class Label(Assembly):
+    def resolve(self, start):
+        return ((self, start),)
+So is a SetLineNo except for adding to the line-number table.
+
+class SetLineNo(Assembly):
+    def __init__(self, line):
+        self.line = line
+    def line_nos(self, start):
+        return ((start, self.line),)
+There are four kinds of bytecode instruction: absolute jumps, relative jumps, and non-jumps with or without an argument. (‘Jump’ for our purposes means any instruction taking a label argument.)
+
+class Instruction(Assembly):
+    def __init__(self, opcode, arg):
+        self.opcode = opcode
+        self.arg    = arg
+        self.length = 1 if arg is None else 3
+    def encode(self, start, addresses):
+        if   self.opcode in dis.hasjabs: arg = addresses[self.arg]
+        elif self.opcode in dis.hasjrel: arg = addresses[self.arg] - (start+3)
+        else:                            arg = self.arg
+        if arg is None: return bytes([self.opcode])
+        else:           return bytes([self.opcode, arg % 256, arg // 256])
+    def plumb(self, depths):
+        arg = 0 if isinstance(self.arg, Label) else self.arg
+        depths.append(depths[-1] + dis.stack_effect(self.opcode, arg))
+plumb computes the stack depth after the instruction as a change from the depth before it: for example, a BINARY_ADD instruction will remove two values from the stack and replace them with one, for a net change in the stack depth of -1. dis.stack_effect gives us this net change.
+
+What about jump instructions? The stack depth right after a jump instruction could be unrelated to the depth before it: instead the depth should be the same at the jump target. CPython’s compiler therefore traces through the jumps, propagating the depths along every path and making sure they’re consistent; but Tailbiter is much simpler. We can almost get away with treating jumps like other instructions, because the code for a statement has no net stack effect: anything it will push on the stack it will later also pop. An if-then-else statement, as we saw above in visit_If, has a test expression, a then-block, and an else-block, with branch and jump instructions in between. The stack depth at the start of the else-block should be the same as at the start of the then-block, but that’s just what it would be if we got there by running the then-block instead of branching around it: we can use the above plumb logic unchanged, as long as dis.stack_effect of the jump instruction is also 0, which it is.
+
+The same nice coincidence doesn’t quite hold for an if expression (like then_exp if test else else_exp). If we compile this the same way—the code for test, a branch, then_exp, a jump, and else_exp—then the stack after then_exp will be 1 deeper than before it. If we’re to analyze the stack depth as if this were all straight-line code with no branches, then we need an extra note that the stack at the start of else_exp is one slot less deep than this analysis would otherwise arrive at. We can hack this into shape by inventing a pseudoinstruction to include at that point in the code:
+
+class OffsetStack(Assembly):
+    def plumb(self, depths):
+        depths.append(depths[-1] - 1)
+So an if expression is compiled exactly like an if statement, except for the added OffsetStack() directive:
+
+# in CodeGen v1+:
+    def visit_IfExp(self, t):
+        orelse, after = Label(), Label()
+        return (           self(t.test) + op.POP_JUMP_IF_FALSE(orelse)
+                         + self(t.body) + op.JUMP_FORWARD(after)
+                + OffsetStack()
+                + orelse + self(t.orelse)
+                + after)
+We’ll see OffsetStack appearing in a couple more places later for the same sort of reason.
+
+A Chain catenates two assembly-code fragments in sequence. It uses itertools.chain to catenate the label resolutions, bytecodes, and lnotab entries produced in the different methods.
+
+# in assembly types and functions v1:
+class Chain(Assembly):
+    def __init__(self, assembly1, assembly2):
+        self.part1 = assembly1
+        self.part2 = assembly2
+        self.length = assembly1.length + assembly2.length
+    def resolve(self, start):
+        return chain(self.part1.resolve(start),
+                     self.part2.resolve(start + self.part1.length))
+    def encode(self, start, addresses):
+        return chain(self.part1.encode(start, addresses),
+                     self.part2.encode(start + self.part1.length, addresses))
+    def line_nos(self, start):
+        return chain(self.part1.line_nos(start),
+                     self.part2.line_nos(start + self.part1.length))
+    def plumb(self, depths):
+        self.part1.plumb(depths)
+        self.part2.plumb(depths)
+(I was a little surprised that no stack overflows bit me with this code, at least not in compiling a program the size of Tailbiter itself. I made no effort to keep the chains balanced.)
+
+Expression types proliferate: more code generation
+Dict literals like {'a': 'x', 'b': 'y'} turn into code like
+
+# in examples:
+       0 BUILD_MAP                2
+       3 LOAD_CONST               0 ('x')
+       6 LOAD_CONST               1 ('a')
+       9 STORE_MAP           
+      10 LOAD_CONST               2 ('y')
+      13 LOAD_CONST               3 ('b')
+      16 STORE_MAP           
+So:
+
+# in CodeGen v1+:
+    def visit_Dict(self, t):
+        return (op.BUILD_MAP(min(0xFFFF, len(t.keys)))
+                + concat([self(v) + self(k) + op.STORE_MAP
+                          for k, v in zip(t.keys, t.values)]))
+The argument to BUILD_MAP gives the runtime a hint of the dict’s size. It’s allowed to be wrong, since dicts can grow and shrink—but not to overflow the two bytes allotted to an argument in bytecode. Thus the min.
+
+A simple subscript expression, a[x], becomes
+
+# in examples:
+       0 LOAD_NAME                0 (a)
+       3 LOAD_NAME                1 (x)
+       6 BINARY_SUBSCR
+Similarly, a.x becomes
+
+# in examples:
+       0 LOAD_NAME                0 (a)
+       3 LOAD_ATTR                1 (x)
+Like name nodes, subscript nodes can appear on the left-hand side of an assignment statement, like a.x = 42. They carry a t.ctx field just like a name’s.
+
+# in CodeGen v1+:
+    def visit_Subscript(self, t):
+        return self(t.value) + self(t.slice.value) + self.subscr_ops[type(t.ctx)]
+    subscr_ops = {ast.Load: op.BINARY_SUBSCR, ast.Store: op.STORE_SUBSCR}
+
+    def visit_Attribute(self, t):
+        sub_op = self.attr_ops[type(t.ctx)]
+        return self(t.value) + sub_op(self.names[t.attr])
+    attr_ops = {ast.Load: op.LOAD_ATTR, ast.Store: op.STORE_ATTR}
+A list or tuple can also appear in both load and store contexts. As a load, ['a', 'b'] becomes
+
+# in examples:
+       0 LOAD_CONST               0 ('a')
+       3 LOAD_CONST               1 ('b')
+       6 BUILD_LIST               2
+where 2 is the length of the list. Unlike with BUILD_MAP the length must be exact.
+
+# in CodeGen v1+:
+    def visit_List(self, t):  return self.visit_sequence(t, op.BUILD_LIST)
+    def visit_Tuple(self, t): return self.visit_sequence(t, op.BUILD_TUPLE)
+
+    def visit_sequence(self, t, build_op):
+        if isinstance(t.ctx, ast.Load):
+            return self(t.elts) + build_op(len(t.elts))
+        elif isinstance(t.ctx, ast.Store):
+            return op.UNPACK_SEQUENCE(len(t.elts)) + self(t.elts)
+        else:
+            assert False
+A unary operator works just like a function call except it gets its own instruction, for efficiency. not -x gets compiled to
+
+# in examples:
+       0 LOAD_NAME                0 (x) 
+       3 UNARY_NEGATIVE       
+       4 UNARY_NOT            
+so:
+
+# in CodeGen v1+:
+    def visit_UnaryOp(self, t):
+        return self(t.operand) + self.ops1[type(t.op)]
+    ops1 = {ast.UAdd: op.UNARY_POSITIVE,  ast.Invert: op.UNARY_INVERT,
+            ast.USub: op.UNARY_NEGATIVE,  ast.Not:    op.UNARY_NOT}
+Binary operators get compiled the same way:
+
+    def visit_BinOp(self, t):
+        return self(t.left) + self(t.right) + self.ops2[type(t.op)]
+    ops2 = {ast.Pow:    op.BINARY_POWER,  ast.Add:  op.BINARY_ADD,
+            ast.LShift: op.BINARY_LSHIFT, ast.Sub:  op.BINARY_SUBTRACT,
+            ast.RShift: op.BINARY_RSHIFT, ast.Mult: op.BINARY_MULTIPLY,
+            ast.BitOr:  op.BINARY_OR,     ast.Mod:  op.BINARY_MODULO,
+            ast.BitAnd: op.BINARY_AND,    ast.Div:  op.BINARY_TRUE_DIVIDE,
+            ast.BitXor: op.BINARY_XOR,    ast.FloorDiv: op.BINARY_FLOOR_DIVIDE}
+compiling, for example, x-1 to
+
+# in examples:
+       0 LOAD_NAME                0 (x) 
+       3 LOAD_CONST               0 (1) 
+       6 BINARY_SUBTRACT
+Comparisons, like x<2, take a slightly different form in the AST, because Python treats a chain of comparisons specially: 1<x<2 is a single expression as a single AST node holding a list of operators and a list of their right operands. Our subset of Python doesn’t cover this case, only binary comparisons like x<2.
+
+# in CodeGen v1+:
+    def visit_Compare(self, t):
+        [operator], [right] = t.ops, t.comparators
+        cmp_index = dis.cmp_op.index(self.ops_cmp[type(operator)])
+        return self(t.left) + self(right) + op.COMPARE_OP(cmp_index)
+    ops_cmp = {ast.Eq: '==', ast.NotEq: '!=', ast.Is: 'is', ast.IsNot: 'is not',
+               ast.Lt: '<',  ast.LtE:   '<=', ast.In: 'in', ast.NotIn: 'not in',
+               ast.Gt: '>',  ast.GtE:   '>='}
+For and and or expressions, like if, we need to be careful about the stack depth across different branches of control. print(x or y) compiles to
+
+# in examples:
+       0 LOAD_NAME                0 (print)
+       3 LOAD_NAME                1 (x)
+       6 JUMP_IF_TRUE_OR_POP     12
+       9 LOAD_NAME                2 (y)
+ >>   12 CALL_FUNCTION            1 (1 positional, 0 keyword pair)
+JUMP_IF_TRUE_OR_POP only pops the tested value if it came out false. At index 12, whichever way execution got there, the stack has the same height: two entries.
+
+# in CodeGen v1+:
+    def visit_BoolOp(self, t):
+        op_jump = self.ops_bool[type(t.op)]
+        def compose(left, right):
+            after = Label()
+            return left + op_jump(after) + OffsetStack() + right + after
+        return reduce(compose, map(self, t.values))
+    ops_bool = {ast.And: op.JUMP_IF_FALSE_OR_POP,
+                ast.Or:  op.JUMP_IF_TRUE_OR_POP}
+Since a BoolOp collects all of the subexpressions of an expression like a and b and c (instead of Python representing this as a tree of binary BoolOps), we must reduce over the list.
+
+OffsetStack() is needed here because, for some reason, for these two branch instructions dis.stack_effect gives the stack effect seen if the jump is taken, instead of at the next instruction.
+
+More statement types
+    def visit_Pass(self, t):
+        return no_op
+
+    def visit_Raise(self, t):
+        return self(t.exc) + op.RAISE_VARARGS(1)
+We handle only the most common form of raise: raise foo.
+
+    def visit_Import(self, t):
+        return concat([self.import_name(0, None, alias.name)
+                       + self.store(alias.asname or alias.name.split('.')[0])
+                       for alias in t.names])
+
+    def visit_ImportFrom(self, t):
+        fromlist = tuple([alias.name for alias in t.names])
+        return (self.import_name(t.level, fromlist, t.module)
+                + concat([op.IMPORT_FROM(self.names[alias.name])
+                          + self.store(alias.asname or alias.name)
+                         for alias in t.names])
+                + op.POP_TOP)
+
+    def import_name(self, level, fromlist, name):
+        return (self.load_const(level)
+                + self.load_const(fromlist)
+                + op.IMPORT_NAME(self.names[name]))
+The import visitors are full of technical details I’ll pass over. We could instead have turned import statements into __import__() calls and assignments, to pass on to the rest of the code generator; but that would take about as much compiler code, to produce worse compiled code.
+
+    def visit_While(self, t):
+        loop, end = Label(), Label()
+        return (  loop + self(t.test) + op.POP_JUMP_IF_FALSE(end)
+                       + self(t.body) + op.JUMP_ABSOLUTE(loop)
+                + end)
+
+    def visit_For(self, t):
+        loop, end = Label(), Label()
+        return (         self(t.iter) + op.GET_ITER
+                + loop + op.FOR_ITER(end) + self(t.target)
+                       + self(t.body) + op.JUMP_ABSOLUTE(loop)
+                + end  + OffsetStack())
+Compiling while and for, for our subset, is much like if. A for loop coerces the value of the t.iter expression to an iterator object, via GET_ITER, leaving the iterator on the stack throughout the loop. When the iterator is exhausted,FOR_ITER(end) pops it off and jumps to end; there we must account for the pop in the stack-depth analysis (OffsetStack()).
+
+Now we have a runnable program again, that can compile nontrivial computations! We could flesh it out further with more node types—break and continue, for example; however, those don’t add materially to the complexity of the kinds of programs we can compile. Consider them an exercise for the reader.
+
+A completed compiler: rendering functions and classes
+The next biggest gain of expressiveness will be in compiling functions and classes. As we’ll see shortly, this requires even bigger changes to our design.
+
+# in figure 2: ASTs added in Tailbiter version 2.
+stmt = FunctionDef(identifier name, arguments args, stmt* body, expr* decorator_list)
+     | ClassDef(identifier name, expr* bases, stmt* body)
+     | Return(expr? value)
+     | Assert(expr test, expr? msg)
+arguments = (arg* args)
+arg = (identifier arg)
+
+expr = Lambda(arguments args, expr body)
+     | ListComp(expr elt, comprehension* generators)
+comprehension = (expr target, expr iter, expr* ifs)
+Once again, we ask ourselves if our current design can handle the complexity we’ve added in this version. Tailbiter v1 jumped immediately into generating code, but now the code for a variable access will depend on how the variable appears in the rest of the source program. It might be a local or a global variable, for instance. As another issue, function definitions and lambda expressions have a lot in common; it’d be easy to end up with duplicated logic in generating code for them. The same goes for list comprehensions (ListComp above) because they act like a nested function (to bound the scope of the loop variables). Therefore, before starting to generate code we’ll do some setup:
+
+First we “desugar” the AST, replacing some of the nodes with equivalent code that uses only simpler node types. (The language minus certain features is less sweet but equally nutritious.) We’ll turn list comprehensions into local functions with a loop, we’ll reduce function defs and lambda expressions to a common form, and while we’re at it we’ll turn assert into if plus raise. CPython has no desugaring pass, though it’s been suggested by some: optimizations would be easier to express as AST rewrites than bytecode rewrites. (A trivial example: change 2+3 to 5.)
+
+We complain if the desugared AST departs from our subset of Python. CPython lacks this pass, of course, and we won’t examine it. It’s valuable in two ways: documenting what we claim to compile correctly, and failing fast on input we never meant to support.
+
+Then we analyze the scope of variables: their definitions and uses in classes and functions (including the functions introduced by desugaring). This scope information is needed to decide where each variable should live at runtime: a global variable will appear in the module’s dictionary, looked up by name, while a local variable appears in a local environment at a known integer index—this is why local variable access is fast. Variables may also be defined in the body of a class—these are similar to global variables—or in an outer scope and then accessed from a lambda expression or nested function definition. These “nonlocal” variables turn into different bytecode than local and global ones.
+
+With the scope info in hand we finally generate bytecode as before, by walking the AST.
+
+Do we need the complication of nonlocal variables? Maybe not: the final compiler uses just two lambda expressions. However, there are nine list comprehensions, and Python’s just no fun without them. To compile them correctly we can’t avoid nested scopes.
+
+Python comes with a scope analyzer built in, the symtable module—but we can’t use it! It requires a source-code string, not an AST, and ASTs lack a method to give us back source code. In Tailbiter’s early development I used symtable anyway, as scaffolding; this forced it to take textual source code instead of an AST for its input.
+
+# in compile to code v2:
+def code_for_module(module_name, filename, t):
+    t = desugar(t)
+    check_conformity(t)
+    return CodeGen(filename, top_scope(t)).compile_module(t, module_name)
+
+<<CodeGen>>
+Sugar delenda est
+Besides NodeVisitor, Python’s ast module defines another visitor class, for not just walking through but transforming trees. It expects each visit method to return an AST node, which will be taken to replace the node that was the argument. The default behavior recurses on child nodes, leaving the node otherwise unchanged. Desugaring uses such a transformer:
+
+def desugar(t):
+    return ast.fix_missing_locations(Desugarer().visit(t))
+
+class Desugarer(ast.NodeTransformer):
+For a start, we rewrite statements like assert cookie, "Want cookie!" into if not cookie: raise AssertionError("Want cookie!")5. (Rather, into an if-then-else with the raise in the else clause: this is slightly simpler.)
+
+    def visit_Assert(self, t):
+        t = self.generic_visit(t)
+        result = ast.If(t.test,
+                        [],
+                        [ast.Raise(Call(ast.Name('AssertionError', load),
+                                        [] if t.msg is None else [t.msg]),
+                                   None)])
+        return ast.copy_location(result, t)
+generic_visit visits and replaces the children of t, as mentioned above. ast.copy_location interpolates a source-line number for any new nodes introduced.
+
+What was the point of this visitor? Without it, we’d need to define a visit_Assert in the code generator instead—OK, fine. This would then need to generate code to perform a test, a call, and a raise. To do this without duplicating logic within the compiler, we’d define code-generation functions for each of those, to be invoked by both the new visit_Assert and by the code generator’s visit_If, visit_Raise, and so on. That’s not onerous, but if we’re desugaring at all, this is a good use for it: it’s easier and clearer.
+
+Lambda expressions and function definitions get rewritten in terms of a new AST node type we’ll define, called Function:
+
+    def visit_Lambda(self, t):
+        t = self.generic_visit(t)
+        result = Function('<lambda>', t.args, [ast.Return(t.body)])
+        return ast.copy_location(result, t)
+
+    def visit_FunctionDef(self, t):
+        t = self.generic_visit(t)
+        fn = Function(t.name, t.args, t.body)
+        for d in reversed(t.decorator_list):
+            fn = Call(d, [fn])
+        result = ast.Assign([ast.Name(t.name, store)], fn)
+        return ast.copy_location(result, t)
+This is as if we turned def answer(): return 42 into answer = lambda: 42, except that a lambda expression can’t carry a name. Reducing to just one type of function node will save work not just in code generation but in scope analysis too, and give us a simpler expansion for list comprehensions. As a bonus, adding a new node type to the language feels like getting away with something.
+
+(The last lines, implementing function decorators, could be left out since Tailbiter doesn’t use decorators.)
+
+List comprehensions also create a Function node, holding the loop, because the loop variables must be defined in their own scope, not polluting the current scope as they did in Python 2.
+
+    def visit_ListComp(self, t):
+        t = self.generic_visit(t)
+        add_element = ast.Attribute(ast.Name('.elements', load), 'append', load)
+        body = ast.Expr(Call(add_element, [t.elt]))
+        for loop in reversed(t.generators):
+            for test in reversed(loop.ifs):
+                body = ast.If(test, [body], [])
+            body = ast.For(loop.target, loop.iter, [body], [])
+        fn = [body,
+              ast.Return(ast.Name('.elements', load))]
+        args = ast.arguments([ast.arg('.elements', None)], None, [], None, [], [])
+        result = Call(Function('<listcomp>', args, fn),
+                      [ast.List([], load)])
+        return ast.copy_location(result, t)
+For instance, [n for n in numbers if n] becomes a call to a locally-defined function almost like below:
+
+# in example.py:
+def listcomp(elements)
+    for n in numbers:
+        if n:
+            elements.append(n)
+    return elements
+elements gets its starting value, a new [], from the call to the local function. The actual tree we generate can’t quite be written as Python source: the function called listcomp above is actually anonymous (the name <listcomp> will appear only as the name of the code object, not as a Python variable), and elements gets named .elements, a name which can’t occur in real Python source code and thus can’t clash with variables from the source.
+
+CPython generates more-efficient bytecode directly from the comprehension, in a hairier way.
+
+We round out Desugarer with a few helpers:
+
+# in compile to code v2:
+class Function(ast.FunctionDef):
+    _fields = ('name', 'args', 'body')
+
+load, store = ast.Load(), ast.Store()
+
+def Call(fn, args):
+    return ast.Call(fn, args, [], None, None)
+(Function derives from FunctionDef so that ast.get_docstring will work on it.)
+
+Variables live in nested scopes
+Functions and classes introduce a new complication: local and nonlocal variables. Consider:
+
+# in example.py:
+def a_function():
+    f1 = "I'm a fast one."
+    def f2(): return d
+    d = "I'm a deref."
+    return a_global_var, f1, f2, d
+f1 is a local variable used only locally within a_function. The interpreter has special support for variables like this: for efficiency their values live in an array instead of a general dictionary structure. (Each call to the function gets a fresh new array.) Once our scope determines this, our revised code generator can emit LOAD_FAST or STORE_FAST to access the variable at a known position in the array:
+
+# in generate variable accesses v2:
+    def load(self, name):
+        access = self.scope.access(name)
+        if   access == 'fast':  return op.LOAD_FAST(self.varnames[name])
+        elif access == 'name':  return op.LOAD_NAME(self.names[name])
+        elif access == 'deref': return op.LOAD_DEREF(self.cell_index(name))
+        else: assert False
+
+    def store(self, name):
+        access = self.scope.access(name)
+        if   access == 'fast':  return op.STORE_FAST(self.varnames[name])
+        elif access == 'name':  return op.STORE_NAME(self.names[name])
+        elif access == 'deref': return op.STORE_DEREF(self.cell_index(name))
+        else: assert False
+
+    def cell_index(self, name):
+        return self.scope.derefvars.index(name)
+Recall that self.varnames maps from local variable names to their positions in the list of such names; the interpreter will know to build an environment of the right size because we included this information in the compiled function’s code object, in make_code.
+
+What about the other variables in this example? f2 is local like f1. (We’ll come back soon to consider the function it names.) a_global_var is global, getting looked up by name at runtime: it has access type 'name', above. CPython’s compiler can use a fourth access type, 'global', as an optimization: the LOAD_GLOBAL instruction looks up the variable name directly in the module’s global environment, but LOAD_NAME, which we use instead, first checks the local environment. We do it this way because Python will need the 'name' access type for the variables in class definitions, as we’ll see, and it’s simplest to use the same type for both.
+
+Finally, there are 'deref' variables like d, which is not global, yet “less local” than f1 in that it’s also used from another scope, the body of f2. Pretend for a moment as if Python didn’t support nonlocal variables. We’d have to transform our example to use only locals and globals, like
+
+# in example.py:
+def a_function():
+    d = Cell()
+    f1 = "I'm a fast one."
+    def f2(d=d): return d.contents
+    d.contents = "I'm a deref."
+    return a_global_var, f1, f2, d.contents
+
+class Cell: pass
+d is now tightly local in each of its scopes, and the d inside f2 is explicitly passed into f2 from the enclosing scope. d no longer refers directly to the value "I'm a deref.", it refers to a data structure, the Cell, whose contents is the value. This indirection makes it possible to pass d into f2 before we’ve assigned its contents. For this to work we had to transform each use of d into d.contents. We also had to create the cell first, before the transformed code.
+
+So, one way to compile our example would be to rewrite it in just this way using a NodeTransformer like the desugarer, then continue, knowing that all the scopes now are “flat”. But we won’t, because the virtual machine was designed to be compiled to directly, with built-in support for a data type similar to our notional Cell class. Each code object will get a tuple of its cell variable names (such as d in a_function); before the interpreter starts running a function, it will automatically create the cells; there are LOAD_DEREF and STORE_DEREF instructions corresponding to our uses of d.contents; and finally, as we’ll see, the instruction to create a function can take a tuple of cells as an argument, corresponding to our d=d. The upshot is that we can compile the body of a function just as we’ve been compiling module-scope code, except we’ll need to distinguish the 'deref' variables like d from the 'fast' and 'name' variables.
+
+There’s one more issue: classes also introduce scopes. Unlike a function scope, a class scope doesn’t get fast or deref variables—only its function-type subscopes do, such as its method definitions. The class’s variables and methods are 'name' variables instead. The interpreter will, after running the compiled body of the class definition, just take the resulting dictionary as the data to build the class object out of.
+
+Tailbiter forbids nested classes, to avoid some of Python’s dark corners, and likewise forbids del statements and explicit nonlocal and global declarations.
+
+We collate the variables and sub-scopes
+Now we know what we need out of our scope objects. We’ll build them in two passes:
+
+# in compile to code v2:
+def top_scope(t):
+    top = Scope(t, ())
+    top.visit(t)
+    top.analyze(set())
+    return top
+The first creates subscopes for classes and functions and records the local uses and definitions of variables. We must walk the AST to collect this information, another job for an AST visitor. Unlike the NodeTransformer last time, we’ll leave the AST alone: our visit methods should instead fill out attributes of the Scope. That’s the protocol for a NodeVisitor:
+
+class Scope(ast.NodeVisitor):
+    def __init__(self, t, defs):
+        self.t = t
+        self.children = {}       # Enclosed sub-scopes
+        self.defs = set(defs)    # Variables defined
+        self.uses = set()        # Variables referenced
+
+    def visit_ClassDef(self, t):
+        self.defs.add(t.name)
+        for expr in t.bases: self.visit(expr)
+        subscope = Scope(t, ())
+        self.children[t] = subscope
+        for stmt in t.body: subscope.visit(stmt)
+
+    def visit_Function(self, t):
+        subscope = Scope(t, [arg.arg for arg in t.args.args])
+        self.children[t] = subscope
+        for stmt in t.body: subscope.visit(stmt)
+
+    def visit_Import(self, t):
+        for alias in t.names:
+            self.defs.add(alias.asname or alias.name.split('.')[0])
+
+    def visit_ImportFrom(self, t):
+        for alias in t.names:
+            self.defs.add(alias.asname or alias.name)
+
+    def visit_Name(self, t):
+        if   isinstance(t.ctx, ast.Load):  self.uses.add(t.id)
+        elif isinstance(t.ctx, ast.Store): self.defs.add(t.id)
+        else: assert False
+There’s a visit action for each type of AST node that either introduces a subscope (ClassDef and Function) or references a variable (the rest). The variable references get collected into two sets, of definitions and uses.
+
+With this information, the analyze pass can then deduce the nonlocal uses of variables. It walks down accumulating the definitions from enclosing function scopes, then back up accumulating the references from enclosed ones:
+
+    def analyze(self, parent_defs):
+        self.fastvars = self.defs if isinstance(self.t, Function) else set()
+        for child in self.children.values():
+            child.analyze(parent_defs | self.fastvars)
+        child_uses = set([var for child in self.children.values()
+                              for var in child.freevars])
+        uses = self.uses | child_uses
+        self.cellvars = tuple(child_uses & self.fastvars)
+        self.freevars = tuple(uses & (parent_defs - self.fastvars))
+        self.derefvars = self.cellvars + self.freevars
+A “cell variable” is a deref defined in the current scope; a “free variable” comes from an enclosing scope instead. In our example, d is a free variable in the lambda expression but a cell variable in the rest of a_function. The code generator will need to know about free variables in order to compile the creation of function objects.
+
+The code generator uses cellvars and freevars, plus this method:
+
+    def access(self, name):
+        return ('deref' if name in self.derefvars else
+                'fast'  if name in self.fastvars else
+                'name')
+Does scope analysis need to precede code generation? If we turned it around, first the code generator would generate a version of symbolic assembly with named variables, then we’d analyze the uses of variables in the assembly code, and finally emit bytecode, treating some of the LOAD_NAMEs as LOAD_FAST, etc. This could be more useful as part of a bytecode rewriting system—for disassembling, transforming, and reassembling, it’d be nice to be able to transform without worrying about the mechanics of cell and free variables—and it might take roughly the same amount of logic. In varying from CPython’s approach, though, it’s riskier.
+
+We generate code for functions
+# in CodeGen v2:
+    def visit_Return(self, t):
+        return ((self(t.value) if t.value else self.load_const(None))
+                + op.RETURN_VALUE)
+We handle both return foo and the no-argument return. (The latter is never used by this compiler.)
+
+A Function node is an expression desugared from a lambda expression, function definition, or list comprehension. Compiling one takes two steps: first, compile its whole body into a separate code object. Second, generate assembly code that will build a function object out of this code object.
+
+    def visit_Function(self, t):
+        code = self.sprout(t).compile_function(t)
+        return self.make_closure(code, t.name)
+The new CodeGen for this new code object requires a subscope of the current scope—previously computed by the scope analyzer, now recovered by self.scope.children[t].
+
+    def sprout(self, t):
+        return CodeGen(self.filename, self.scope.children[t])
+Building a function out of a code object depends on whether it has free variables. lambda x: lambda y: x + y compiles to
+
+# in examples:
+       0 LOAD_CONST               1 (<code object <lambda> at ...)
+       3 LOAD_CONST               2 ('<lambda>')
+       6 MAKE_FUNCTION            0
+where the first constant is the code object for lambda y: x + y, whose code in turn should be
+
+       0 LOAD_CLOSURE             0 (x)
+       3 BUILD_TUPLE              1
+       6 LOAD_CONST               1 (<code object <lambda> at ...)
+       9 LOAD_CONST               2 ('<lambda>')
+      12 MAKE_CLOSURE             0
+      15 RETURN_VALUE
+The code object loaded by the instruction at 6 (and not shown here) finally does the actual adding of x and y.
+
+The outer lambda, with no free variables, becomes a MAKE_FUNCTION; the inner one becomes a MAKE_CLOSURE passed a tuple of deref cells. (LOAD_CLOSURE will load x’s cell, instead of the contents of the cell as LOAD_DEREF would do. The scope analyzer already arranged for the needed cells to be among the current scope’s cellvars.) The second LOAD_CONST in either case loads the name of the new function. (In “real” Python the nested lambda’s name would be <lambda>.<locals>.<lambda>, reflecting the nesting.)
+
+# in CodeGen v2:
+    def make_closure(self, code, name):
+        if code.co_freevars:
+            return (concat([op.LOAD_CLOSURE(self.cell_index(freevar))
+                            for freevar in code.co_freevars])
+                    + op.BUILD_TUPLE(len(code.co_freevars))
+                    + self.load_const(code) + self.load_const(name)
+                    + op.MAKE_CLOSURE(0))
+        else:
+            return (self.load_const(code) + self.load_const(name)
+                    + op.MAKE_FUNCTION(0))
+Recall that visit_Function wanted a code object for the function in question. On a new CodeGen instance, it called compile_function:
+
+    def compile_function(self, t):
+        self.load_const(ast.get_docstring(t))
+        for arg in t.args.args:
+            self.varnames[arg.arg]
+        assembly = self(t.body) + self.load_const(None) + op.RETURN_VALUE
+        return self.make_code(assembly, t.name, len(t.args.args))
+When CPython wants a function’s docstring, it looks in the code object’s constants table at the first entry. We put the docstring there, in the first entry, by calling load_const with it first, before we generate any code. (The actual LOAD_CONST instruction returned is discarded.) This depends on our table preserving the order that we add to it.
+
+As with the docstring, the parameter names become the first elements of the varnames table. (Remember they’re defaultdicts: fetching adds to them as needed.)
+
+We generate assembly that will run the function’s body and return None (in case the body had no return of its own); then we assemble it all into a code object.
+
+Classes too
+Like functions, class definitions sprout a new CodeGen to compile down to a code object; but the assembly for building the class object is a little bit fancier.
+
+    def visit_ClassDef(self, t):
+        code = self.sprout(t).compile_class(t)
+        return (op.LOAD_BUILD_CLASS + self.make_closure(code, t.name)
+                                    + self.load_const(t.name)
+                                    + self(t.bases)
+                + op.CALL_FUNCTION(2 + len(t.bases))
+                + self.store(t.name))
+The class definition’s code object resembles an ordinary function’s with some magic local-variable definitions prepended. (The docstring doesn’t start the constants table, for these.) Python’s class builder (LOAD_BUILD_CLASS) will populate the new class’s attributes from the locals dictionary as of the point this function returns. This again is why scope analysis must not classify the locals of a class definition as 'fast': they need to live in a dictionary, not an array.
+
+    def compile_class(self, t):
+        docstring = ast.get_docstring(t)
+        assembly = (  self.load('__name__')      + self.store('__module__')
+                    + self.load_const(t.name)    + self.store('__qualname__')
+                    + (no_op if docstring is None else
+                       self.load_const(docstring) + self.store('__doc__'))
+                    + self(t.body) + self.load_const(None) + op.RETURN_VALUE)
+        return self.make_code(assembly, t.name, 0)
+OK, so! Wind it all up and watch the tail-eating:
+
+# in transcripts:
+$ python3 tailbiter2.py tailbiter2.py tailbiter2.py greet.py 
+Hi, Chrysophylax
+Or try it on a buggy program—i.e., most programs most of the time—and get a proper traceback.
+
+But why compile?
+We’ve taken considerable trouble to convert from one fairly-arbitrary representation to another. After so many mundane details, you might reasonably ask why you ever thought compilers might be cool. We’ve cost ourselves not just this work and complexity of translating, but also of translating back: debuggers and profilers must map what happens in bytecode to terms meaningful in the source. Why not interpret programs directly in their first form, the AST?
+
+First, for the compact linear form of bytecode. An AST is fatter and distributed in memory, interlinked by pointers; the size and the pointer-chasing both would slow an interpreter down. One core job, then, was mere rearrangement: taking a data structure (the AST) meant for arbitrary viewing and changing, and laying it out just right for the interpreter, who will find each element ready to hand at the moment it’s needed—like, for us, reading a recipe and starting by laying the ingredients and pans onto the counter in a sensible order.
+
+Second, to precompute. We analyzed the scopes and how they used variables, to find, ahead of time, the place in the runtime environment where a variable will live—letting the interpreter skip looking up the name.
+
+A third kind of win is possible in rewriting the program as we compile it—“optimization.” Perhaps the compiler could notice that [i*2 for i in range(10)] would go faster as list(range(0, 20, 2)). This is precomputation in a broader, open-ended sense (sometimes called the Full Employment Theorem for Compiler Writers). But isn’t this orthogonal to translating source to binary? Aren’t there independent source- and machine-code optimizers? Yes, but a compiler might improve the target code based on analysis of the source. An optimizer ignorant of the original source may have much more trouble understanding the machine code it’s trying to optimize; on the other hand, a source-to-source optimizer deals in the wrong language to even express some machine-level optimizations. A compiler can potentially unite a high-level view with grubby hands.
+
+Well, that sounds compelling. Maybe. But CPython hardly optimizes at all. (PyPy is another story.) Could we get the first two advantages more easily? What if we ran the scope analysis and performed a generic kind of rearrangement: that is, re-represented the AST in a tight linear form, with the debug info pushed off to the side? The code generator could look vaguely like
+
+# in bluesky.py:
+def visit_If(self, t):
+    test, body, orelse = self(t.test), self(t.body), self(t.orelse)
+    return [compact_ast.IF, len(test), len(body)] + test + body + orelse
+(But instead of writing a lot of stereotyped visitor methods like this we’d try to derive all the logic automatically from the ASDL definitions of the AST datatypes.)
+
+With this “compact AST” you’d point to an AST node’s representation via a numeric offset into an array such as this method returns: so the t.test passed in here becomes a subarray starting at index 3, t.body then follows starting from 3+array[1], and so on. This form could be nearly as tight as bytecode (once we use bytes and not the general integers which were quicker to explain), while still viewable as just another form of AST, making the compiler and surrounding tools all simpler. In numbers, how much better is the bytecode virtual machine?
+
+Exploring that question exceeds my scope here—but maybe not yours.
+
+Continuations
+Where next? Since writing this, I’ve let it grow a little to be able to compile an interpreter (adapted from Byterun) of the CPython bytecodes we emit; you can find both together in the Tailbiter repo. There’s a start on a Python parser; finish that and add an implementation of the core Python runtime features like dictionaries and classes, and you’d be approaching a genuinely self-sustaining system like Smalltalk. (I think the biggest remaining lacuna would be exception handling.)
+
+An optimizer’s yet unwritten. I can imagine one serving to prototype a successor for CPython’s peephole optimizer, someday. And how fast can we compile? Faster than I did, that can’t be hard.
+
+Peter Norvig’s Paradigms of Artificial Intelligence Programming, despite the title, presents short compilers for Scheme, Prolog, and a pattern-matching rewrite-rule language. They all go to some trouble to produce efficient output. The code is of the highest quality.
+
+Niklaus Wirth’s Compiler Construction details a simple compiler from Oberon-0 to RISC machine code. Wirth and Gutknecht’s Project Oberon: The Design of an Operating System, a Compiler, and a Computer elaborates it to the full Oberon language it’s written in, ending up at about 3000 lines.
+
+Andrew Appel’s Modern Compiler Implementation in ML explains the ideas behind fancier optimizing compilers.
+
+CPython 2 has a compiler module in 4500 lines of Python, seemingly included just for fun. For the compiler that’s normally run, see the guide, compile.c, and symtable.c; there’s also the optimizer peephole.c.
+
+Our compiler compiled itself, but we stopped short of applying this ability towards anything remarkable. (Can you change the language yet?) Ken Thompson showed one surprising direction to take, in “Reflections on Trusting Trust”.
+
+So it came over him all of a sudden that he would take Tailbiter and go dragon-hunting.
+—J.R.R. Tolkien, Farmer Giles of Ham
+
+Thanks to Michael DiBernardo for editing earlier drafts of this chapter for 500 Lines or Less, and especially for his grace when I abandoned it; Andrew Gwozdziewycz and Chris Seaton for reviewing a draft of the code; Dave Long for conversations about assembly and code generation; Shae Erisson and Kevin Lee for beta reading; and David Albert and Rachel Vincent for shepherding this through to the end.
+
+The tool used here for multi-version literate programming is a hacked version of handaxeweb by Kragen Sitaker.
+
+A Python bytestring, such as b'foo', is like a string, but of 8-bit bytes instead of Unicode characters. ↩
+
+There’s no tool to dump the AST and the disassembly together like this. ↩
+
+The virtual machine makes the stack not an actual Python list object, but a low-level array of words in memory. It’s conventionally pictured as vertical instead of horizontal: a stack with a top we “push” onto and “pop” from, changing its “depth.” ↩
+
+As a technicality, the CALL_FUNCTION instruction’s argument is a two-byte integer (like all instruction arguments, when present) but encoding two individual bytes: the counts of keyword and positional arguments. Python’s bytecode format does give a way to encode bigger numbers, but we punt on them. ↩
+
+You might wonder if this is quite correct: what if the code being compiled redefines AssertionError? But assert itself at runtime calls whatever AssertionError is bound to. ↩
+
+Published February 2017.
+
+Darius Bacon is a nomadic catsitter and alum of the Fall '12, Fall 2 '16, and Winter 1 '16 batches of RC.
+Editors: David Albert
+ tweet this post
+Next: Data driven literary analysis
+A publication from the Recurse Center
+ SubscribeTwitterPast IssuesAbout
