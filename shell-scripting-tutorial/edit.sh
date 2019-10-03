@@ -2,9 +2,8 @@
 
 a=0
 
-until [[! $a -lt 10]]
-do
+until [[! $a -lt 10]]; do
 	echo $a
-	a='expr $a + 1'
+	a=`expr $a + 1`
 done
 
