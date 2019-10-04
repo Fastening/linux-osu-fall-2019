@@ -1,7 +1,9 @@
 #!/bin/bash
 
 
-test=test-data.txt
+test=$1
+
+echo "remember the test data is variable 1"
 
 cat $test | grep -Eo "\w[A-Za-z]*.ion" > /tmp/ion.txt
 
