@@ -6,6 +6,8 @@ Replacement_Delimeter=$3
 
 echo "USE LIKE THIS: ./formatter.sh CSV_File Current_Delimeter Replacement_Delimeter"
 
-awk '{print $0}' "$CSV_File"  | tr -s "$Current_Delimeter" "$Replacement_Delimeter"
+#awk '{print $0}' "$CSV_File"  | tr -s "$Current_Delimeter" "$Replacement_Delimeter"
+
+awk '{print $0}' "$CSV_File" | sed "s/"$Current_Delimeter"/"$Replacement_Delimeter"/g"
 
 echo "DONE"
